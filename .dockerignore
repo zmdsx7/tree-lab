@@ -1,0 +1,9 @@
+target/
+.git/
+.idea/
+.vscode/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.DS_Store
