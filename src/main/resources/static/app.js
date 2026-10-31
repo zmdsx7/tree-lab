@@ -20,21 +20,22 @@ const msg = text => {
 
 // ติดต่อ Java Backend
 async function api(path, method = 'GET', body) {
+    const headers = { 'Content-Type': 'application/json' };
+    if (!['GET', 'HEAD', 'OPTIONS'].includes(method.toUpperCase())) {
+        const tokenResponse = await fetch('/api/auth/csrf', { credentials: 'same-origin' });
+        if (!tokenResponse.ok) throw Error('ไม่สามารถเตรียมการเชื่อมต่อ กรุณาโหลดหน้าเว็บใหม่');
+        const csrf = await tokenResponse.json();
+        headers[csrf.headerName] = csrf.token;
+    }
     const response = await fetch('/api' + path, {
-        method,
-        headers: {
-            'Content-Type': 'application/json'
-        },
-        body: body === undefined
-            ? undefined
-            : JSON.stringify(body)
+        method, headers, credentials: 'same-origin',
+        body: body === undefined ? undefined : JSON.stringify(body)
     });
-
     if (!response.ok) {
         const error = await response.json().catch(() => ({}));
+        if (response.status === 401 && typeof setCurrentUser === 'function') setCurrentUser(null);
         throw Error(error.message || 'เกิดข้อผิดพลาด');
     }
-
     return response.json();
 }
 
@@ -543,6 +544,7 @@ $('#compare').onclick = async () => {
 // บันทึกประวัติ
 $('#save').onclick = async () => {
     try {
+        if (!await requireAccount()) return;
         if (!actions.length) {
             throw Error('กรุณาสร้างต้นไม้ก่อน');
         }
@@ -571,6 +573,7 @@ $('#save').onclick = async () => {
 // เปิดประวัติ
 $('#historyButton').onclick = async () => {
     try {
+        if (!await requireAccount()) return;
         const history = await api('/history');
 
         $('#modalTitle').textContent = 'ประวัติที่บันทึก';
