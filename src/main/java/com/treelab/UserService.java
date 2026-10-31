@@ -3,7 +3,12 @@ package com.treelab;
 import java.util.*;
 import java.nio.charset.StandardCharsets;
 import org.springframework.stereotype.Service;
-import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.data.mongodb.core.query.*;
+import org.springframework.data.domain.Sort;
+import org.bson.Document;
+import org.bson.types.ObjectId;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.dao.DataAccessException;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.web.server.ResponseStatusException;
@@ -11,15 +16,15 @@ import org.springframework.http.HttpStatus;
 
 @Service
 public class UserService {
-    public record User(long id, String name, String email) {}
+    public record User(String id, String name, String email) {}
     private record Account(User user, String hash) {}
-    private final JdbcTemplate db;
+    private final MongoTemplate db;
     private final PasswordEncoder passwords;
     private final String dummyHash;
-    public UserService(JdbcTemplate db, PasswordEncoder passwords) {
+    public UserService(MongoTemplate db, PasswordEncoder passwords) {
         this.db=db;this.passwords=passwords;
         dummyHash=passwords.encode(UUID.randomUUID().toString());
-        db.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP)");
+        db.indexOps("users").ensureIndex(new org.springframework.data.mongodb.core.index.Index().on("email", Sort.Direction.ASC).unique());
     }
     private String email(String value) {
         if(value==null)throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"กรุณากรอกอีเมล");
@@ -36,25 +41,26 @@ public class UserService {
         String normalized=email(email);password(password);
         if(name==null || name.trim().isEmpty() || name.trim().length()>80)
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"ชื่อต้องมี 1–80 ตัวอักษร");
-        try { db.update("INSERT INTO users(name,email,password_hash) VALUES (?,?,?)",name.trim(),normalized,passwords.encode(password)); }
-        catch(DataAccessException ex){
-            // SQLite may report UNIQUE violations as UncategorizedSQLException.
-            if(db.queryForObject("SELECT COUNT(*) FROM users WHERE email=?",Integer.class,normalized)>0)
-                throw new ResponseStatusException(HttpStatus.CONFLICT,"อีเมลนี้ถูกใช้งานแล้ว");
-            throw ex;
-        }
+        Document account=new Document("_id",new ObjectId()).append("name",name.trim()).append("email",normalized)
+            .append("password_hash",passwords.encode(password)).append("created_at",new Date());
+        try { db.insert(account,"users"); }
+        catch(DuplicateKeyException ex){throw new ResponseStatusException(HttpStatus.CONFLICT,"อีเมลนี้ถูกใช้งานแล้ว");}
         return find(normalized);
     }
     public User login(String email,String password) {
         String normalized=email(email);
         if(password==null || password.getBytes(StandardCharsets.UTF_8).length>72)
             throw new ResponseStatusException(HttpStatus.UNAUTHORIZED,"อีเมลหรือรหัสผ่านไม่ถูกต้อง");
-        List<Account> rows=db.query("SELECT id,name,email,password_hash FROM users WHERE email=?",(rs,i)->new Account(new User(rs.getLong(1),rs.getString(2),rs.getString(3)),rs.getString(4)),normalized);
-        boolean valid=passwords.matches(password,rows.isEmpty()?dummyHash:rows.get(0).hash());
-        if(rows.isEmpty() || !valid)throw new ResponseStatusException(HttpStatus.UNAUTHORIZED,"อีเมลหรือรหัสผ่านไม่ถูกต้อง");
-        return rows.get(0).user();
+        Document account=db.findOne(Query.query(Criteria.where("email").is(normalized)),Document.class,"users");
+        boolean valid=passwords.matches(password,account==null?dummyHash:account.getString("password_hash"));
+        if(account==null || !valid)throw new ResponseStatusException(HttpStatus.UNAUTHORIZED,"อีเมลหรือรหัสผ่านไม่ถูกต้อง");
+        return user(account);
     }
+    private User user(Document d){return new User(d.getObjectId("_id").toHexString(),d.getString("name"),d.getString("email"));}
+
     public User find(String email) {
-        return db.queryForObject("SELECT id,name,email FROM users WHERE email=?",(rs,i)->new User(rs.getLong(1),rs.getString(2),rs.getString(3)),email);
+        Document account=db.findOne(Query.query(Criteria.where("email").is(email)),Document.class,"users");
+        if(account==null)throw new ResponseStatusException(HttpStatus.UNAUTHORIZED,"กรุณาเข้าสู่ระบบใหม่");
+        return user(account);
     }
 }

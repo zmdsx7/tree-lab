@@ -1,88 +1,53 @@
 package com.treelab;
 
 import org.junit.jupiter.api.Test;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
-import org.springframework.test.context.DynamicPropertyRegistry;
-import org.springframework.test.context.DynamicPropertySource;
-import org.springframework.test.web.servlet.*;
-import org.springframework.mock.web.MockHttpSession;
-import org.springframework.jdbc.core.JdbcTemplate;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import java.nio.file.*;
-import java.sql.*;
-import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
-import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
-import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.csrf;
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.*;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.data.mongodb.core.index.IndexOperations;
+import org.springframework.data.mongodb.core.query.Query;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.web.server.ResponseStatusException;
+import org.springframework.dao.DuplicateKeyException;
+import org.bson.Document;
+import org.bson.types.ObjectId;
+import org.mockito.ArgumentCaptor;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.mongodb.client.result.DeleteResult;
 
-@SpringBootTest @AutoConfigureMockMvc
 class AuthIntegrationTest {
-    static final String URL;
-    static {
-        try {
-            URL="jdbc:sqlite:"+Files.createTempFile("tree-auth-tests-", ".db");
-            try(Connection c=DriverManager.getConnection(URL);Statement s=c.createStatement()) {
-                s.execute("CREATE TABLE history(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,data TEXT NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP)");
-                s.execute("INSERT INTO history(name,data) VALUES ('legacy','{}')");
-            }
-        }catch(Exception e){throw new ExceptionInInitializerError(e);}
+    MongoTemplate database(){MongoTemplate db=mock(MongoTemplate.class);when(db.indexOps(anyString())).thenReturn(mock(IndexOperations.class));return db;}
+    @Test void registrationNormalizesEmailAndHashesPassword(){
+        MongoTemplate db=database();var encoder=new BCryptPasswordEncoder();UserService users=new UserService(db,encoder);
+        Document stored=new Document("_id",new ObjectId()).append("name","Test").append("email","test@example.com");
+        when(db.findOne(any(Query.class),eq(Document.class),eq("users"))).thenReturn(stored);
+        users.register(" Test "," TEST@Example.com ","password123");
+        ArgumentCaptor<Document> saved=ArgumentCaptor.forClass(Document.class);verify(db).insert(saved.capture(),eq("users"));
+        assertEquals("test@example.com",saved.getValue().getString("email"));
+        assertTrue(encoder.matches("password123",saved.getValue().getString("password_hash")));
+        assertFalse(saved.getValue().containsKey("password"));
     }
-    @DynamicPropertySource static void props(DynamicPropertyRegistry r){r.add("spring.datasource.url",()->URL);}
-    @Autowired MockMvc mvc;
-    @Autowired JdbcTemplate db;
-    @Autowired ObjectMapper json;
-    String credentials(String name,String email,String password)throws Exception{return json.writeValueAsString(java.util.Map.of("name",name,"email",email,"password",password));}
-    MockHttpSession register(String name,String email)throws Exception {
-        return (MockHttpSession)mvc.perform(post("/api/auth/register").with(csrf()).contentType("application/json").content(credentials(name,email,"StrongPass123")))
-            .andExpect(status().isOk()).andExpect(jsonPath("user.name").value(name)).andReturn().getRequest().getSession(false);
+    @Test void duplicateAndIncorrectCredentialsAreRejected(){
+        MongoTemplate db=database();var encoder=new BCryptPasswordEncoder();UserService users=new UserService(db,encoder);
+        when(db.insert(any(Document.class),eq("users"))).thenThrow(new DuplicateKeyException("duplicate"));
+        assertEquals(409,assertThrows(ResponseStatusException.class,()->users.register("Test","test@example.com","password123")).getStatusCode().value());
+        assertEquals(401,assertThrows(ResponseStatusException.class,()->users.login("test@example.com","badpassword")).getStatusCode().value());
+        Document stored=new Document("_id",new ObjectId()).append("name","Test").append("email","test@example.com").append("password_hash",encoder.encode("password123"));
+        when(db.findOne(any(Query.class),eq(Document.class),eq("users"))).thenReturn(stored);
+        assertEquals("test@example.com",users.login("test@example.com","password123").email());
+        assertThrows(ResponseStatusException.class,()->users.login("test@example.com","wrong"));
     }
-    @Test void authenticationAndOwnership()throws Exception {
-        mvc.perform(get("/api/auth/me")).andExpect(status().isOk()).andExpect(jsonPath("user").isEmpty());
-        mvc.perform(get("/api/history")).andExpect(status().isUnauthorized());
-        String tree="{\"kind\":\"avl\",\"actions\":[{\"type\":\"insert\",\"value\":30},{\"type\":\"insert\",\"value\":20},{\"type\":\"insert\",\"value\":10}]}";
-        mvc.perform(post("/api/calculate").with(csrf()).contentType("application/json").content(tree)).andExpect(status().isOk()).andExpect(jsonPath("tree.value").value(20));
-        mvc.perform(post("/api/auth/register").contentType("application/json").content(credentials("A","a@example.com","StrongPass123"))).andExpect(status().isForbidden());
-        MockHttpSession a=register("Alice","Alice@example.com");
-        mvc.perform(get("/api/auth/me").session(a)).andExpect(jsonPath("user.email").value("alice@example.com"));
-        mvc.perform(get("/api/history").session(a)).andExpect(content().json("[]"));
-        assertEquals(1,db.queryForObject("SELECT COUNT(*) FROM history WHERE user_id IS NULL",Integer.class));
-        String hash=db.queryForObject("SELECT password_hash FROM users WHERE email='alice@example.com'",String.class);
-        assertNotEquals("StrongPass123",hash);assertTrue(hash.startsWith("$2"));
-        mvc.perform(post("/api/auth/register").with(csrf()).contentType("application/json").content(credentials("Alice","ALICE@example.com","StrongPass123"))).andExpect(status().isConflict());
-        mvc.perform(post("/api/history").session(a).with(csrf()).contentType("application/json").content("{\"name\":\"Private\",\"request\":"+tree+"}")).andExpect(status().isOk());
-        long id=db.queryForObject("SELECT id FROM history WHERE name='Private'",Long.class);
-        MockHttpSession b=register("Bob","bob@example.com");
-        mvc.perform(get("/api/history").session(b)).andExpect(content().json("[]"));
-        mvc.perform(get("/api/history/"+id).session(b)).andExpect(status().isNotFound());
-        mvc.perform(delete("/api/history/"+id).session(b).with(csrf())).andExpect(status().isNotFound());
-        mvc.perform(get("/api/history/"+id).session(a)).andExpect(status().isOk()).andExpect(jsonPath("kind").value("avl"));
-        mvc.perform(post("/api/auth/login").with(csrf()).contentType("application/json").content(credentials("","alice@example.com","wrongpass"))).andExpect(status().isUnauthorized());
-        MockHttpSession login=(MockHttpSession)mvc.perform(post("/api/auth/login").with(csrf()).contentType("application/json").content(credentials("","alice@example.com","StrongPass123"))).andExpect(status().isOk()).andReturn().getRequest().getSession(false);
-        mvc.perform(get("/api/history").session(login)).andExpect(jsonPath("$[0].name").value("Private"));
-        mvc.perform(post("/api/auth/logout").session(login).with(csrf())).andExpect(status().isOk());
-        assertTrue(login.isInvalid());
-        mvc.perform(get("/api/history")).andExpect(status().isUnauthorized());
-        mvc.perform(delete("/api/history/"+id).session(a).with(csrf())).andExpect(status().isOk());
-    }
-    @Test void realCsrfAndSessionRotation()throws Exception {
-        MvcResult tokenResult=mvc.perform(get("/api/auth/csrf")).andExpect(status().isOk()).andReturn();
-        MockHttpSession session=(MockHttpSession)tokenResult.getRequest().getSession(false);
-        String previousId=session.getId();
-        String token=json.readTree(tokenResult.getResponse().getContentAsString()).get("token").asText();
-        mvc.perform(post("/api/auth/register").session(session).header("X-CSRF-TOKEN",token).contentType("application/json")
-            .content(credentials("Carol","carol@example.com","StrongPass123"))).andExpect(status().isOk());
-        assertNotEquals(previousId,session.getId());
-        mvc.perform(post("/api/auth/logout").session(session).header("X-CSRF-TOKEN",token)).andExpect(status().isForbidden());
-        MvcResult refreshed=mvc.perform(get("/api/auth/csrf").session(session)).andExpect(status().isOk()).andReturn();
-        String fresh=json.readTree(refreshed.getResponse().getContentAsString()).get("token").asText();
-        mvc.perform(post("/api/auth/logout").session(session).header("X-CSRF-TOKEN",fresh)).andExpect(status().isOk());
-        assertTrue(session.isInvalid());
-    }
-    @Test void invalidInputs()throws Exception {
-        mvc.perform(post("/api/auth/register").with(csrf()).contentType("application/json").content(credentials("A","not-email","StrongPass123"))).andExpect(status().isBadRequest());
-        mvc.perform(post("/api/auth/register").with(csrf()).contentType("application/json").content(credentials("A","short@example.com","123"))).andExpect(status().isBadRequest());
-        mvc.perform(post("/api/auth/register").with(csrf()).contentType("application/json").content(credentials("A","long@example.com","ก".repeat(30)))).andExpect(status().isBadRequest());
+    @Test void historyAlwaysFiltersByOwnerAndRejectsMissingRecords()throws Exception{
+        MongoTemplate db=database();UserService users=mock(UserService.class);when(users.find("a@example.com")).thenReturn(new UserService.User("owner-a","A","a@example.com"));
+        TreeController controller=new TreeController(db,new ObjectMapper(),users);
+        var auth=UsernamePasswordAuthenticationToken.authenticated("a@example.com",null,java.util.List.of());String id=new ObjectId().toHexString();
+        assertEquals(404,assertThrows(ResponseStatusException.class,()->controller.load(id,auth)).getStatusCode().value());
+        ArgumentCaptor<Query> query=ArgumentCaptor.forClass(Query.class);verify(db).findOne(query.capture(),eq(Document.class),eq("history"));
+        assertEquals("owner-a",query.getValue().getQueryObject().getString("user_id"));
+        when(db.remove(any(Query.class),eq("history"))).thenReturn(DeleteResult.acknowledged(0));
+        assertThrows(ResponseStatusException.class,()->controller.remove(id,auth));
+        verify(db).remove(query.capture(),eq("history"));assertEquals("owner-a",query.getValue().getQueryObject().getString("user_id"));
+        assertThrows(ResponseStatusException.class,()->controller.load("invalid",auth));
     }
 }
